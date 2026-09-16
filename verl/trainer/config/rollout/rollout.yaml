@@ -7,6 +7,9 @@ name: ???
 # sync: LLM, async: AsyncLLM
 mode: async
 
+# Optional external service provider; null preserves native LLMServerManager.
+llm_server_manager_class: null
+
 # Number of nodes for standalone rollout server, must be > 0 in one-step-off/fully async training.
 nnodes: 0
 

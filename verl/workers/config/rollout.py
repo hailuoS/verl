@@ -237,6 +237,9 @@ class RolloutConfig(BaseConfig):
     # loads this class instead of the built-in CheckpointEngineManager.
     checkpoint_manager_class: Optional[str] = None
 
+    # Fully qualified service provider class. None preserves native replica management.
+    llm_server_manager_class: Optional[str] = None
+
     # Checkpoint Engine config for update weights from trainer to rollout
     checkpoint_engine: CheckpointEngineConfig = field(default_factory=CheckpointEngineConfig)
 

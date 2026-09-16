@@ -948,7 +948,13 @@ class RayPPOTrainer:
         # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
         enable_agent_reward_loop = not self.use_rm or self.config.reward.reward_model.enable_resource_pool
 
-        self.llm_server_manager = LLMServerManager.create(
+        # Optional service provider seam for independently managed inference.
+        # Providers validate their supported training/generation capabilities.
+        service_class_fqn = self.config.actor_rollout_ref.rollout.get("llm_server_manager_class")
+        service_class = (
+            load_class_from_fqn(service_class_fqn, "LLMServerManager") if service_class_fqn else LLMServerManager
+        )
+        self.llm_server_manager = service_class.create(
             config=self.config, worker_group=self.actor_rollout_wg, rollout_resource_pool=actor_rollout_resource_pool
         )
 
