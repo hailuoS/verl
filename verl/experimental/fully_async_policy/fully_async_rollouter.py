@@ -898,6 +898,15 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         max_concurrent = self.max_concurrent_samples if self.max_concurrent_samples is not None else 0
         self._active_count_history.append((time.time(), len(self.active_tasks), max_concurrent))
 
+    async def _reap_active_tasks(self, done_tasks):
+        """Observe every completed sample before propagating the first failure."""
+        self.active_tasks.difference_update(done_tasks)
+        self._record_active_count()
+        results = await asyncio.gather(*done_tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+
     async def _processor_worker(self):
         """
         Streaming worker coroutines, a sample is submitted for processing without waiting for batches
@@ -924,10 +933,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                         actual_done = done - {resume_future}
                         if actual_done:
                             async with self.lock:
-                                for task in actual_done:
-                                    self.active_tasks.discard(task)
-                                    await task
-                                self._record_active_count()
+                                await self._reap_active_tasks(actual_done)
                         if resume_future in done:
                             print(
                                 "[FullyAsyncRollouter][Processor] "
@@ -945,8 +951,29 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                         resume_future.cancel()
                         await asyncio.gather(resume_future, return_exceptions=True)
                 continue
-            # Get sample from appropriate queue and immediately mark task as done
-            rollout_sample = await self.pending_queue.get()
+            # Watch in-flight generations while waiting for another sample. A crashed
+            # request must fail the rollouter even if the feed has stopped producing.
+            queue_task = asyncio.create_task(self.pending_queue.get())
+            try:
+                done, _ = await asyncio.wait(
+                    {queue_task, *self.active_tasks}, return_when=asyncio.FIRST_COMPLETED
+                )
+                finished = done - {queue_task}
+                if finished:
+                    async with self.lock:
+                        await self._reap_active_tasks(finished)
+                if queue_task not in done:
+                    # Reaping can yield after wait() took its done snapshot. Cancel
+                    # the waiter, then check whether it already consumed a sample.
+                    queue_task.cancel()
+                    await asyncio.gather(queue_task, return_exceptions=True)
+                    if queue_task.cancelled():
+                        continue
+                rollout_sample = queue_task.result()
+            finally:
+                if not queue_task.done():
+                    queue_task.cancel()
+                await asyncio.gather(queue_task, return_exceptions=True)
             self.pending_queue.task_done()
             self.staleness_samples += 1
 
@@ -957,24 +984,20 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 while self.active_tasks:
                     async with self.lock:
                         if self.active_tasks:
-                            done_tasks, self.active_tasks = await asyncio.wait(
+                            done_tasks, _ = await asyncio.wait(
                                 self.active_tasks, return_when=asyncio.FIRST_COMPLETED
                             )
-                            for task in done_tasks:
-                                await task
-                            self._record_active_count()
+                            await self._reap_active_tasks(done_tasks)
                 break
 
             # Check whether the number of concurrent tasks exceeds the limit
             while len(self.active_tasks) >= self.max_concurrent_samples:
                 async with self.lock:
                     if self.active_tasks:
-                        done_tasks, self.active_tasks = await asyncio.wait(
+                        done_tasks, _ = await asyncio.wait(
                             self.active_tasks, return_when=asyncio.FIRST_COMPLETED
                         )
-                        for task in done_tasks:
-                            await task
-                        self._record_active_count()
+                        await self._reap_active_tasks(done_tasks)
 
             # Submit single sample processing
             if self.paused:
@@ -1052,7 +1075,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         except Exception as e:
             print(f"[FullyAsyncRollouter] Streaming process exception: {e}")
-            raise e
+            raise
 
         finally:
             if self.feed_task and not self.feed_task.done():
@@ -1062,6 +1085,17 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             if self.processor_task and not self.processor_task.done():
                 self.processor_task.cancel()
                 await asyncio.gather(self.processor_task, return_exceptions=True)
+
+            async with self.lock:
+                active_tasks = tuple(self.active_tasks)
+            for task in active_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*active_tasks, return_exceptions=True)
+            async with self.lock:
+                self.active_tasks.difference_update(active_tasks)
+                if active_tasks:
+                    self._record_active_count()
 
             self.feed_task = None
             self.processor_task = None
@@ -1093,12 +1127,13 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         generation_task = safe_create_task(self._streaming_generation_main(), name="generation_task")
         monitor_task = safe_create_task(self._async_monitor_loop(), name="monitor_task")
 
+        main_tasks = asyncio.gather(generation_task, monitor_task)
         try:
             # Run build and monitoring tasks concurrently
-            await asyncio.gather(generation_task, monitor_task, return_exceptions=True)
-        except Exception as e:
-            print(f"[FullyAsyncRollouter] Asynchronous task execution error: {e}")
+            await asyncio.shield(main_tasks)
         finally:
+            # Shield the gather so cancellation of fit() does not cancel its
+            # children before this cleanup can cancel and await them once.
             if not generation_task.done():
                 generation_task.cancel()
             if not monitor_task.done():
@@ -1106,6 +1141,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
             # Wait for the task to complete
             await asyncio.gather(generation_task, monitor_task, return_exceptions=True)
+            await asyncio.gather(main_tasks, return_exceptions=True)
 
         print("[FullyAsyncRollouter] Rollouter fit completed")
 
