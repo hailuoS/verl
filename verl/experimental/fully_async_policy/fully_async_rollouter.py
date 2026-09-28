@@ -40,6 +40,7 @@ from verl.trainer.ppo.utils import (
     need_reward_model,
 )
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
+from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.profiler import marked_timer
 from verl.utils.skip import SkipManager
 from verl.utils.tracking import ValidationGenerationsLogger
@@ -820,14 +821,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         """
         Create the server manager and agent loop manager for fully async training.
 
-        Uses :class:`FullyAsyncLLMServerManager` which supports two-phase init:
-        - Phase 1: hybrid replicas on trainer GPUs (sleeping)
-        - Phase 2: standalone replicas on rollout GPUs
-
-        The ``GlobalRequestLoadBalancer`` (which also holds the server-handle
-        registry) serves as the single source of truth for handle mapping and
-        routing.  Clients look up handles atomically — no per-worker notification
-        needed on hybrid add/remove.
+        The native manager remains the default and owns its load balancer.
+        A configured external manager supplies its own client and routing.
         """
         # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
         # agent_reward_loop: streaming reward computation with actor rollout
@@ -842,15 +837,19 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         assert self.config.actor_rollout_ref.rollout.mode == "async"
 
         self.async_rollout_mode = True
-        # Use FullyAsyncLLMServerManager for two-phase (hybrid + standalone) init.
-        # It creates GlobalRequestLoadBalancer (with merged handle registry) internally.
-        self.llm_server_manager = await FullyAsyncLLMServerManager.create(
+        # External services can own rollout replicas and routing. The native
+        # manager remains the default for existing fully-async configurations.
+        manager_fqn = self.config.actor_rollout_ref.rollout.get("llm_server_manager_class")
+        manager_cls = (
+            load_class_from_fqn(manager_fqn, "LLMServerManager") if manager_fqn else FullyAsyncLLMServerManager
+        )
+        self.llm_server_manager = await manager_cls.create(
             config=self.config,
             worker_group=self.get_hybrid_worker_group(),
         )
         self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
             config=self.config,
-            llm_client=self.llm_server_manager.get_client(client_cls=FullyAsyncLLMServerClient),
+            llm_client=self.llm_server_manager.get_client(),
             reward_loop_worker_handles=reward_loop_worker_handles,
             teacher_client=self.teacher_model_manager.get_client() if self.teacher_model_manager else None,
         )

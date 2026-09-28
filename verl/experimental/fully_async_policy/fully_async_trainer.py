@@ -39,6 +39,7 @@ from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
+from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.tracking import Tracking
 
 logger = logging.getLogger(__name__)
@@ -218,7 +219,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         """Setup checkpoint manager after rollouter is initialized"""
         replicas = await self.rollouter.get_replicas.remote()
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
-        self.checkpoint_manager = CheckpointEngineManager(
+        manager_fqn = self.config.actor_rollout_ref.rollout.get("checkpoint_manager_class")
+        manager_cls = (
+            load_class_from_fqn(manager_fqn, "CheckpointEngineManager") if manager_fqn else CheckpointEngineManager
+        )
+        self.checkpoint_manager = manager_cls(
             config=checkpoint_engine_config, actor_wg=self.actor_wg, replicas=replicas
         )
         print(f"[FullyAsyncTrainer] Checkpoint manager initialized (backend={checkpoint_engine_config.backend})")
