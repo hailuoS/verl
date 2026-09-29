@@ -131,6 +131,8 @@ class PPOTrainer(ABC):
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self.trainer_mode = self.config.trainer.v1.trainer_mode
+        if not self.config.actor_rollout_ref.hybrid_engine and self.trainer_mode != "separate_async":
+            raise ValueError("hybrid_engine=false requires V1 separate_async trainer mode")
         self.parameter_sync_step = self.config.trainer.v1.get(self.trainer_mode, {}).get("parameter_sync_step", 1)
         self.replay_buffer = self._build_replay_buffer()
         self._rollout_moe_lb_metrics_accumulator = RolloutMoELoadBalanceMetricsAccumulator(
@@ -348,22 +350,25 @@ class PPOTrainer(ABC):
             self.distillation_config = None
 
         # 9. initialize agent loop manager
-        self.llm_server_manager: LLMServerManager = LLMServerManager.create(
-            config=self.config, worker_group=self.actor_rollout_wg, rollout_resource_pool=actor_rollout_resource_pool
-        )
+        self.llm_server_manager: LLMServerManager | None = None
+        self.checkpoint_manager: CheckpointEngineManager | None = None
+        if self.config.actor_rollout_ref.hybrid_engine:
+            self.llm_server_manager = LLMServerManager.create(
+                config=self.config,
+                worker_group=self.actor_rollout_wg,
+                rollout_resource_pool=actor_rollout_resource_pool,
+            )
 
-        # 10. initialize checkpoint engine manager
-        checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
-        checkpoint_engine_config.backend = "naive"
-        self.checkpoint_manager: CheckpointEngineManager = CheckpointEngineManager(
-            config=checkpoint_engine_config,
-            actor_wg=self.actor_rollout_wg,
-            replicas=self.llm_server_manager.get_replicas(),
-        )
-        logger.info("checkpoint engine manager initialized")
-
-        # sleep all replicas to load checkpoint
-        self.checkpoint_manager.sleep_replicas()
+            # 10. initialize checkpoint engine manager for colocated rollout
+            checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
+            checkpoint_engine_config.backend = "naive"
+            self.checkpoint_manager = CheckpointEngineManager(
+                config=checkpoint_engine_config,
+                actor_wg=self.actor_rollout_wg,
+                replicas=self.llm_server_manager.get_replicas(),
+            )
+            logger.info("checkpoint engine manager initialized")
+            self.checkpoint_manager.sleep_replicas()
         self._load_checkpoint()
 
         logger.info("all initialize finished, ready to fit")
@@ -994,9 +999,11 @@ class PPOTrainer(ABC):
 
             # 3. [OPTIONAL] compute reward score with colocated reward model
             if self.reward_loop_manager.reward_loop_worker_handles is None:
-                self.checkpoint_manager.sleep_replicas()
+                if self.checkpoint_manager is not None:
+                    self.checkpoint_manager.sleep_replicas()
                 batch = self._compute_reward_colocate(batch)
-                self.checkpoint_manager.update_weights()
+                if self.checkpoint_manager is not None:
+                    self.checkpoint_manager.update_weights()
 
             # 4. collect necessary data for logging
             # For multi-output agent loops, only use the final output per session for metrics.

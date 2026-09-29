@@ -40,7 +40,6 @@ from verl.trainer.ppo.utils import (
     need_reward_model,
 )
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
-from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.profiler import marked_timer
 from verl.utils.skip import SkipManager
 from verl.utils.tracking import ValidationGenerationsLogger
@@ -821,8 +820,14 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         """
         Create the server manager and agent loop manager for fully async training.
 
-        The native manager remains the default and owns its load balancer.
-        A configured external manager supplies its own client and routing.
+        Uses :class:`FullyAsyncLLMServerManager` which supports two-phase init:
+        - Phase 1: hybrid replicas on trainer GPUs (sleeping)
+        - Phase 2: standalone replicas on rollout GPUs
+
+        The ``GlobalRequestLoadBalancer`` (which also holds the server-handle
+        registry) serves as the single source of truth for handle mapping and
+        routing.  Clients look up handles atomically — no per-worker notification
+        needed on hybrid add/remove.
         """
         # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
         # agent_reward_loop: streaming reward computation with actor rollout
@@ -837,19 +842,15 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         assert self.config.actor_rollout_ref.rollout.mode == "async"
 
         self.async_rollout_mode = True
-        # External services can own rollout replicas and routing. The native
-        # manager remains the default for existing fully-async configurations.
-        manager_fqn = self.config.actor_rollout_ref.rollout.get("llm_server_manager_class")
-        manager_cls = (
-            load_class_from_fqn(manager_fqn, "LLMServerManager") if manager_fqn else FullyAsyncLLMServerManager
-        )
-        self.llm_server_manager = await manager_cls.create(
+        # Use FullyAsyncLLMServerManager for two-phase (hybrid + standalone) init.
+        # It creates GlobalRequestLoadBalancer (with merged handle registry) internally.
+        self.llm_server_manager = await FullyAsyncLLMServerManager.create(
             config=self.config,
             worker_group=self.get_hybrid_worker_group(),
         )
         self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
             config=self.config,
-            llm_client=self.llm_server_manager.get_client(),
+            llm_client=self.llm_server_manager.get_client(client_cls=FullyAsyncLLMServerClient),
             reward_loop_worker_handles=reward_loop_worker_handles,
             teacher_client=self.teacher_model_manager.get_client() if self.teacher_model_manager else None,
         )
@@ -898,15 +899,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         max_concurrent = self.max_concurrent_samples if self.max_concurrent_samples is not None else 0
         self._active_count_history.append((time.time(), len(self.active_tasks), max_concurrent))
 
-    async def _reap_active_tasks(self, done_tasks):
-        """Observe every completed sample before propagating the first failure."""
-        self.active_tasks.difference_update(done_tasks)
-        self._record_active_count()
-        results = await asyncio.gather(*done_tasks, return_exceptions=True)
-        for result in results:
-            if isinstance(result, BaseException):
-                raise result
-
     async def _processor_worker(self):
         """
         Streaming worker coroutines, a sample is submitted for processing without waiting for batches
@@ -933,7 +925,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                         actual_done = done - {resume_future}
                         if actual_done:
                             async with self.lock:
-                                await self._reap_active_tasks(actual_done)
+                                for task in actual_done:
+                                    self.active_tasks.discard(task)
+                                    await task
+                                self._record_active_count()
                         if resume_future in done:
                             print(
                                 "[FullyAsyncRollouter][Processor] "
@@ -951,29 +946,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                         resume_future.cancel()
                         await asyncio.gather(resume_future, return_exceptions=True)
                 continue
-            # Watch in-flight generations while waiting for another sample. A crashed
-            # request must fail the rollouter even if the feed has stopped producing.
-            queue_task = asyncio.create_task(self.pending_queue.get())
-            try:
-                done, _ = await asyncio.wait(
-                    {queue_task, *self.active_tasks}, return_when=asyncio.FIRST_COMPLETED
-                )
-                finished = done - {queue_task}
-                if finished:
-                    async with self.lock:
-                        await self._reap_active_tasks(finished)
-                if queue_task not in done:
-                    # Reaping can yield after wait() took its done snapshot. Cancel
-                    # the waiter, then check whether it already consumed a sample.
-                    queue_task.cancel()
-                    await asyncio.gather(queue_task, return_exceptions=True)
-                    if queue_task.cancelled():
-                        continue
-                rollout_sample = queue_task.result()
-            finally:
-                if not queue_task.done():
-                    queue_task.cancel()
-                await asyncio.gather(queue_task, return_exceptions=True)
+            # Get sample from appropriate queue and immediately mark task as done
+            rollout_sample = await self.pending_queue.get()
             self.pending_queue.task_done()
             self.staleness_samples += 1
 
@@ -984,20 +958,24 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 while self.active_tasks:
                     async with self.lock:
                         if self.active_tasks:
-                            done_tasks, _ = await asyncio.wait(
+                            done_tasks, self.active_tasks = await asyncio.wait(
                                 self.active_tasks, return_when=asyncio.FIRST_COMPLETED
                             )
-                            await self._reap_active_tasks(done_tasks)
+                            for task in done_tasks:
+                                await task
+                            self._record_active_count()
                 break
 
             # Check whether the number of concurrent tasks exceeds the limit
             while len(self.active_tasks) >= self.max_concurrent_samples:
                 async with self.lock:
                     if self.active_tasks:
-                        done_tasks, _ = await asyncio.wait(
+                        done_tasks, self.active_tasks = await asyncio.wait(
                             self.active_tasks, return_when=asyncio.FIRST_COMPLETED
                         )
-                        await self._reap_active_tasks(done_tasks)
+                        for task in done_tasks:
+                            await task
+                        self._record_active_count()
 
             # Submit single sample processing
             if self.paused:
@@ -1075,7 +1053,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         except Exception as e:
             print(f"[FullyAsyncRollouter] Streaming process exception: {e}")
-            raise
+            raise e
 
         finally:
             if self.feed_task and not self.feed_task.done():
@@ -1085,17 +1063,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             if self.processor_task and not self.processor_task.done():
                 self.processor_task.cancel()
                 await asyncio.gather(self.processor_task, return_exceptions=True)
-
-            async with self.lock:
-                active_tasks = tuple(self.active_tasks)
-            for task in active_tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*active_tasks, return_exceptions=True)
-            async with self.lock:
-                self.active_tasks.difference_update(active_tasks)
-                if active_tasks:
-                    self._record_active_count()
 
             self.feed_task = None
             self.processor_task = None
@@ -1127,13 +1094,12 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         generation_task = safe_create_task(self._streaming_generation_main(), name="generation_task")
         monitor_task = safe_create_task(self._async_monitor_loop(), name="monitor_task")
 
-        main_tasks = asyncio.gather(generation_task, monitor_task)
         try:
             # Run build and monitoring tasks concurrently
-            await asyncio.shield(main_tasks)
+            await asyncio.gather(generation_task, monitor_task, return_exceptions=True)
+        except Exception as e:
+            print(f"[FullyAsyncRollouter] Asynchronous task execution error: {e}")
         finally:
-            # Shield the gather so cancellation of fit() does not cancel its
-            # children before this cleanup can cancel and await them once.
             if not generation_task.done():
                 generation_task.cancel()
             if not monitor_task.done():
@@ -1141,7 +1107,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
             # Wait for the task to complete
             await asyncio.gather(generation_task, monitor_task, return_exceptions=True)
-            await asyncio.gather(main_tasks, return_exceptions=True)
 
         print("[FullyAsyncRollouter] Rollouter fit completed")
 

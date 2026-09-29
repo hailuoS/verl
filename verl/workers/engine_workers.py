@@ -466,7 +466,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.rollout: BaseRollout = None
         assert self.role in ["actor", "rollout", "ref", "actor_rollout", "actor_rollout_ref"]
         self._is_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref"]
-        self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
+        self._is_rollout = self.role == "rollout" or (
+            self.role in ["actor_rollout", "actor_rollout_ref"] and self.config.get("hybrid_engine", True)
+        )
         self._is_ref = self.role in ["ref", "actor_rollout_ref"]
 
         if self._is_actor:
@@ -641,7 +643,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.set_dispatch_collect(mesh_name="actor", **self.actor.get_dispatch_collect())
 
         # 3. build rollout engine
-        if "rollout" in self.role:
+        if self._is_rollout:
             rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
 
             # TODO: move rollout_device_mesh into ServerAdapter

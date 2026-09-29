@@ -25,6 +25,7 @@ from verl.trainer.ppo.utils import Role, need_reward_model
 from verl.trainer.ppo.v1.trainer_base import PPOTrainer, register_trainer
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
+from verl.utils.import_utils import load_class_from_fqn
 from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient, LLMServerManager
 
 logger = logging.getLogger(__name__)
@@ -83,22 +84,31 @@ class PPOTrainerSeparateAsync(PPOTrainer):
 
         # initialize standalone rollout
         # TODO: make initialization parallel with super().init()
-        hybrid_num_replicas = len(self.llm_server_manager.rollout_replicas)
-        self.standalone_server_manager: LLMServerManager = LLMServerManager.create(
-            config=self.config, start_rank=hybrid_num_replicas
+        hybrid_num_replicas = len(self.llm_server_manager.rollout_replicas) if self.llm_server_manager else 0
+        manager_class_fqn = self.config.actor_rollout_ref.rollout.get("llm_server_manager_class")
+        manager_class = (
+            load_class_from_fqn(manager_class_fqn, "LLMServerManager") if manager_class_fqn else LLMServerManager
         )
+        self.standalone_server_manager = manager_class.create(config=self.config, start_rank=hybrid_num_replicas)
 
         # create checkpoint engine manager for trainer and standalone rollout
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
-        self.standalone_checkpoint_manager = CheckpointEngineManager(
+        checkpoint_manager_class_fqn = self.config.actor_rollout_ref.rollout.get("checkpoint_manager_class")
+        checkpoint_manager_class = (
+            load_class_from_fqn(checkpoint_manager_class_fqn, "CheckpointEngineManager")
+            if checkpoint_manager_class_fqn
+            else CheckpointEngineManager
+        )
+        self.standalone_checkpoint_manager = checkpoint_manager_class(
             config=checkpoint_engine_config,
             actor_wg=self.actor_rollout_wg,
             replicas=self.standalone_server_manager.get_replicas(),
         )
 
-        # hybrid engine is in rollout mode after initialization
-        self.current_mode = HybridEngineMode.ROLLOUT
-        self.add_replicas_to_balancer()
+        # With separate rollout NPUs there is no colocated server to switch.
+        self.current_mode = HybridEngineMode.ROLLOUT if self.llm_server_manager else HybridEngineMode.TRAINER
+        if self.llm_server_manager:
+            self.add_replicas_to_balancer()
 
     def _compute_old_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Version-aware old_log_probs computation for Decoupled PPO.
@@ -128,12 +138,15 @@ class PPOTrainerSeparateAsync(PPOTrainer):
 
     def get_llm_client(self):
         # get server client from standalone rollout
+        if self.config.actor_rollout_ref.rollout.get("llm_server_manager_class"):
+            return self.standalone_server_manager.get_client()
         return self.standalone_server_manager.get_client(client_cls=FullyAsyncLLMServerClient)
 
     def on_init_end(self):
         # update weights after loading checkpoint
         self.standalone_checkpoint_manager.update_weights(self.global_steps)
-        self.checkpoint_manager.update_weights(self.global_steps)
+        if self.checkpoint_manager is not None:
+            self.checkpoint_manager.update_weights(self.global_steps)
 
     def on_train_begin(self):
         if self.config.skip.rollout_tq.enable:
@@ -144,17 +157,21 @@ class PPOTrainerSeparateAsync(PPOTrainer):
         logger.info(f"Added {num_warmup_batches} warmup batches to the agent loop manager")
 
     def on_validate_begin(self):
-        if self.current_mode == HybridEngineMode.TRAINER:
+        if self.llm_server_manager and self.current_mode == HybridEngineMode.TRAINER:
             logger.info("Switching hybrid engine to rollout mode for validation")
             self.switch_to_rollout()
 
     def on_sample_begin(self):
-        if self.current_mode == HybridEngineMode.TRAINER and self.should_switch_to_rollout():
+        if (
+            self.llm_server_manager
+            and self.current_mode == HybridEngineMode.TRAINER
+            and self.should_switch_to_rollout()
+        ):
             logger.info("Switching hybrid engine to rollout mode for generation")
             self.switch_to_rollout()
 
     def on_sample_end(self):
-        if self.current_mode == HybridEngineMode.ROLLOUT:
+        if self.llm_server_manager and self.current_mode == HybridEngineMode.ROLLOUT:
             logger.info("Switching hybrid engine to trainer mode for training")
             self.switch_to_trainer()
 
