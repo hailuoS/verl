@@ -174,10 +174,16 @@ def main(config):
     # Automatically set `config.trainer.device = npu` when running on Ascend NPU.
     auto_set_device(config)
 
-    if config.get("elastic", {}).get("enabled", False):
-        from elastic_rollout.integrations.verl.native_entry import run_native
+    elastic = config.get("elastic")
+    if elastic is not None:
+        if "enable" in elastic or "enabled" not in elastic:
+            raise ValueError("Use +elastic.enabled=true (not elastic.enable) to enable ElasticRollout")
+        if type(elastic.enabled) is not bool:
+            raise ValueError("elastic.enabled must be a boolean")
+        if elastic.enabled:
+            from elastic_rollout.integrations.verl.native_entry import run_native
 
-        raise SystemExit(run_native(config))
+            raise SystemExit(run_native(config))
 
     # validate config
     validate_config(
