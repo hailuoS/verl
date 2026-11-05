@@ -119,6 +119,7 @@ class RayResourcePool(ResourcePool):
         max_colocate_count: int = 10,
         detached=False,
         accelerator_type: Optional[str] = None,
+        placement_group_node_ids: Optional[list[str]] = None,
     ) -> None:
         super().__init__(process_on_nodes, max_colocate_count)
         self.use_gpu = use_gpu
@@ -127,6 +128,7 @@ class RayResourcePool(ResourcePool):
         self.pgs = None
         self.detached = detached
         self.accelerator_type = accelerator_type
+        self.placement_group_node_ids = placement_group_node_ids
 
     def get_placement_groups(self, strategy="STRICT_PACK", name=None, device_name="cuda"):
         if self.pgs is not None:
@@ -151,9 +153,20 @@ class RayResourcePool(ResourcePool):
         pg_scheme = [[bundle.copy() for _ in range(process_count)] for process_count in self._store]
 
         lifetime = "detached" if self.detached else None
+        if self.placement_group_node_ids is not None and len(self.placement_group_node_ids) != len(pg_scheme):
+            raise ValueError("placement_group_node_ids must match process_on_nodes")
 
         pgs = [
-            placement_group(bundles=bundles, strategy=strategy, name=pg_name_prefix + str(idx), lifetime=lifetime)
+            placement_group(
+                bundles=bundles,
+                strategy=strategy,
+                name=pg_name_prefix + str(idx),
+                lifetime=lifetime,
+                **(
+                    {"bundle_label_selector": [{"ray.io/node-id": self.placement_group_node_ids[idx]}] * len(bundles)}
+                    if self.placement_group_node_ids is not None else {}
+                ),
+            )
             for idx, bundles in enumerate(pg_scheme)
         ]
 
@@ -191,6 +204,7 @@ class ResourcePoolManager:
     mapping: dict[int, str]
     max_colocate_count: int = 3
     resource_pool_dict: dict[str, RayResourcePool] = field(default_factory=dict)
+    placement_group_node_ids: dict[str, list[str]] = field(default_factory=dict)
 
     def create_resource_pool(self):
         """Create Ray resource pools for distributed training.
@@ -210,6 +224,7 @@ class ResourcePoolManager:
                 use_gpu=True,
                 max_colocate_count=self.max_colocate_count,
                 name_prefix=resource_pool_name,
+                placement_group_node_ids=self.placement_group_node_ids.get(resource_pool_name),
             )
             self.resource_pool_dict[resource_pool_name] = resource_pool
 

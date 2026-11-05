@@ -174,6 +174,11 @@ def main(config):
     # Automatically set `config.trainer.device = npu` when running on Ascend NPU.
     auto_set_device(config)
 
+    if config.get("elastic", {}).get("enabled", False):
+        from elastic_rollout.integrations.verl.native_entry import run_native
+
+        raise SystemExit(run_native(config))
+
     # validate config
     validate_config(
         config=config,
