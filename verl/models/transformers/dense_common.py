@@ -68,6 +68,24 @@ def forward_base_model(
     return outputs
 
 
+def _torch_fused_lm_head_forward(self, hidden_states, *, input_ids=None, temperature=1.0):
+    if input_ids is None:
+        return self._verl_linear_forward(hidden_states)
+    from verl.utils.experimental.torch_functional import FusedLinearForPPO
+
+    return FusedLinearForPPO()(hidden_states, self.weight, input_ids, temperature)
+
+
+def torch_fused_lm_head(lm_head, hidden_states, input_ids, temperature=1.0):
+    """Run the fused head through Module.__call__ so FSDP hooks unshard weights."""
+    from types import MethodType
+
+    if not hasattr(lm_head, "_verl_linear_forward"):
+        lm_head._verl_linear_forward = lm_head.forward
+        lm_head.forward = MethodType(_torch_fused_lm_head_forward, lm_head)
+    return lm_head(hidden_states, input_ids=input_ids, temperature=temperature)
+
+
 def forward_with_torch_backend(
     self,
     input_ids: torch.LongTensor = None,
@@ -86,8 +104,6 @@ def forward_with_torch_backend(
     shift_labels: Optional[torch.LongTensor] = None,
     **loss_kwargs,
 ) -> tuple | CausalLMOutputForPPO:
-    from verl.utils.experimental.torch_functional import FusedLinearForPPO
-
     outputs = forward_base_model(
         self,
         input_ids=input_ids,
@@ -119,13 +135,7 @@ def forward_with_torch_backend(
     else:
         raise RuntimeError("To use forward_with_torch_backend, either labels or input_ids must be provided.")
 
-    fused_linear_for_ppo = FusedLinearForPPO()
-    log_probs, entropy = fused_linear_for_ppo.forward(
-        hidden_states=hidden_states,
-        vocab_weights=self.lm_head.weight,
-        input_ids=rolled_labels,
-        temperature=temperature,
-    )
+    log_probs, entropy = torch_fused_lm_head(self.lm_head, hidden_states, rolled_labels, temperature)
 
     return CausalLMOutputForPPO(
         log_probs=log_probs,

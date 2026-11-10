@@ -281,6 +281,9 @@ class FSDPEngineConfig(EngineConfig):
     _mutable_fields = EngineConfig._mutable_fields | {"ulysses_sequence_parallel_size"}
 
     # fsdp specific flags
+    # Process-local allocator option for disaggregated NPU training; never export
+    # PYTORCH_NPU_ALLOC_CONF to vLLM's sleep-mode allocator.
+    npu_expandable_segments: Optional[bool] = None
     wrap_policy: dict[str, Any] = field(default_factory=dict)
     offload_policy: bool = False
     reshard_after_forward: bool = True
@@ -302,6 +305,8 @@ class FSDPEngineConfig(EngineConfig):
     def __post_init__(self):
         super().__post_init__()
         assert self.strategy in ["fsdp", "fsdp2"], f"strategy {self.strategy} not supported"
+        if self.npu_expandable_segments is not None and type(self.npu_expandable_segments) is not bool:
+            raise ValueError("npu_expandable_segments must be a boolean or null")
 
 
 @dataclass

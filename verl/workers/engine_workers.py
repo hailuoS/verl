@@ -533,6 +533,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
+        if self._is_actor and self.config.actor.strategy in ("fsdp", "fsdp2"):
+            allocator_setting = self.config.actor.fsdp_config.get("npu_expandable_segments")
+            if allocator_setting is not None and self._is_rollout:
+                raise ValueError("npu_expandable_segments requires separate training and rollout processes")
         model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model)
 
         # 1. build reference model

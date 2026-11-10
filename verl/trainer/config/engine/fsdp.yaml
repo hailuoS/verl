@@ -1,6 +1,9 @@
 # Target class for this configuration
 _target_: verl.workers.config.FSDPEngineConfig
 
+# Process-local NPU training allocator option. Requires separate rollout workers.
+npu_expandable_segments: null
+
 # policy for wrapping the model
 wrap_policy:
 

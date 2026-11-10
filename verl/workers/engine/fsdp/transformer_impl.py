@@ -113,6 +113,15 @@ class FSDPEngine(BaseEngine):
         self.optimizer_config = optimizer_config
         self.checkpoint_config = checkpoint_config
 
+        if self.engine_config.npu_expandable_segments is not None:
+            if device_name != "npu":
+                raise ValueError("npu_expandable_segments is only supported on NPU")
+            # Call directly so an unsupported allocator API fails visibly. The
+            # process environment stays unchanged for separate rollout workers.
+            torch.npu.memory._set_allocator_settings(
+                f"expandable_segments:{self.engine_config.npu_expandable_segments}"
+            )
+
         self.mode = None
 
         self.rank = torch.distributed.get_rank()
