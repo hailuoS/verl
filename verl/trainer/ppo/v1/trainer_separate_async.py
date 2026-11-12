@@ -53,10 +53,11 @@ class PPOTrainerSeparateAsync(PPOTrainer):
             f"training, but got train_batch_size={train_batch_size}, "
             f"parameter_sync_step={parameter_sync_step}, ppo_mini_batch_size={ppo_mini_batch_size}"
         )
-        assert config.actor_rollout_ref.rollout.nnodes > 0, "nnodes must be > 0 in separate async training"
-        assert config.actor_rollout_ref.rollout.n_gpus_per_node > 0, (
-            "n_gpus_per_node must be > 0 in separate async training"
-        )
+        if not config.actor_rollout_ref.rollout.get("llm_server_manager_class"):
+            assert config.actor_rollout_ref.rollout.nnodes > 0, "nnodes must be > 0 in separate async training"
+            assert config.actor_rollout_ref.rollout.n_gpus_per_node > 0, (
+                "n_gpus_per_node must be > 0 in separate async training"
+            )
         assert config.actor_rollout_ref.rollout.checkpoint_engine.backend != "naive", (
             "please use nccl/nixl/mooncake, etc. backend for separate async training"
         )
@@ -189,8 +190,11 @@ class PPOTrainerSeparateAsync(PPOTrainer):
         undercounts the total hardware footprint.
         """
         trainer_gpus = self.resource_pool_manager.get_n_gpus()
+        get_n_gpus = getattr(self.standalone_server_manager, "get_n_gpus", None)
         rollout_gpus = (
-            self.config.actor_rollout_ref.rollout.n_gpus_per_node * self.config.actor_rollout_ref.rollout.nnodes
+            get_n_gpus()
+            if get_n_gpus is not None
+            else self.config.actor_rollout_ref.rollout.n_gpus_per_node * self.config.actor_rollout_ref.rollout.nnodes
         )
         return trainer_gpus + rollout_gpus
 
